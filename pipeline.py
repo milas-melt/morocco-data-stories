@@ -121,7 +121,8 @@ def generate_script_llm(persona: str, summary: str, language: str = "en") -> str
     )
 
     user_prompt = f"""
-Write a narration script of about 160 to 220 words in {lang_desc}.
+Write a narration script of about 70 to 100 words in {lang_desc}.
+Absolutely do not exceed 100 words.
 
 Audience: {persona_desc}.
 
@@ -152,11 +153,17 @@ Requirements:
         text = response.choices[0].message.content.strip()
         if not text:
             print("Empty LLM response, using stub script.")
-            return generate_script_stub(persona, summary)
-        return text
+            return clamp_script_length(
+                generate_script_stub(persona, summary),
+                max_words=100,
+            )
+        return clamp_script_length(text, max_words=100)
     except Exception as e:
         print("OpenAI error, using stub script:", repr(e))
-        return generate_script_stub(persona, summary)
+        return clamp_script_length(
+            generate_script_stub(persona, summary),
+            max_words=100,
+        )
 
 
 def generate_video_story(
@@ -167,22 +174,25 @@ def generate_video_story(
     """
     Orchestration function.
 
-    For now:
     - Generate narration script with OpenAI
-    - Generate MP3 narration with ElevenLabs
-    - Return (audio_path, script, video_path=None)
+    - Generate MP3 narration with ElevenLabs (via fal)
+    - Generate talking video with VEED Fabric 1.0 Fast (via fal), if an image is available
     """
     df = load_education_data()
     summary = summarise_for_llm(df)
     script = generate_script_llm(persona=persona, summary=summary, language=language)
 
     audio_path = text_to_speech_file(script)
-    video_path = None  # placeholder for VEED / fal integration later
+
+    # Make sure this file actually exists
+    image_path = "assets/morocco_education.png"
+
+    video_path = generate_video_with_veed_fal(script, audio_path, image_path)
 
     return audio_path, script, video_path
 
 
-def text_to_speech_file(text: str, voice: str = "Rachel") -> str | None:
+def text_to_speech_file(text: str, voice: str = "Brian") -> str | None:
     """
     Generate MP3 narration using ElevenLabs Turbo v2.5 via fal.
     Returns local file path to the MP3, or None on failure.
@@ -200,7 +210,7 @@ def text_to_speech_file(text: str, voice: str = "Rachel") -> str | None:
             arguments={
                 "text": text,
                 # Optional tunables – safe defaults:
-                "voice": voice,  # defaults to "Rachel" if omitted
+                "voice": voice,
                 "stability": 0.5,
                 "similarity_boost": 0.75,
                 "speed": 1.0,
@@ -233,33 +243,184 @@ def text_to_speech_file(text: str, voice: str = "Rachel") -> str | None:
 
 def upload_audio_to_fal(audio_path: str) -> str | None:
     """
-    Upload local audio file to fal storage and return a URL fal/VEED can see.
+    Upload local MP3 file to fal storage so VEED (or any fal model) can access it.
+    Returns a public HTTPS URL.
     """
-    if fal_client is None:
-        print("WARNING: FAL_KEY not set, skipping video generation.")
+    if not FAL_KEY:
+        print("WARNING: FAL_KEY not set, skipping upload.")
         return None
 
     if not os.path.exists(audio_path):
-        print(f"Audio file not found, cannot upload: {audio_path}")
+        print("Audio file does not exist:", audio_path)
         return None
 
     try:
-        with open(audio_path, "rb") as f:
-            uploaded = fal_client.storage.upload_file(
-                f, filename=os.path.basename(audio_path)
-            )
-        # uploaded.url should be an HTTPS URL accessible to VEED within fal
-        return uploaded.url
+        uploaded = fal_client.upload_file(audio_path)
+
+        # Handle several possible return formats
+
+        # 1) Already a string URL
+        if isinstance(uploaded, str):
+            return uploaded
+
+        # 2) Dict-like: {"url": "..."}
+        if isinstance(uploaded, dict):
+            url = uploaded.get("url")
+            if url:
+                return url
+
+        # 3) Object with .url attribute
+        if hasattr(uploaded, "url"):
+            return uploaded.url
+
+        print("Unexpected response from fal_client.upload_file:", repr(uploaded))
+        return None
+
     except Exception as e:
-        print("Error uploading audio to fal:", repr(e))
+        print("Error uploading audio to fal storage:", repr(e))
         return None
 
 
+def upload_file_to_fal(path: str) -> str | None:
+    """
+    Upload a local file (audio/image/etc.) to fal storage and return a public HTTPS URL.
+    """
+    if not FAL_KEY:
+        print("WARNING: FAL_KEY not set, skipping upload.")
+        return None
+
+    if not os.path.exists(path):
+        print("File does not exist:", path)
+        return None
+
+    try:
+        uploaded = fal_client.upload_file(path)
+
+        # 1) String URL
+        if isinstance(uploaded, str):
+            return uploaded
+
+        # 2) Dict with "url"
+        if isinstance(uploaded, dict):
+            url = uploaded.get("url")
+            if url:
+                return url
+
+        # 3) Object with .url attribute
+        if hasattr(uploaded, "url"):
+            return uploaded.url
+
+        print("Unexpected response from fal_client.upload_file:", repr(uploaded))
+        return None
+
+    except Exception as e:
+        print("Error uploading file to fal storage:", repr(e))
+        return None
+
+
+def generate_video_with_veed_fal(
+    script: str,
+    audio_path: str | None,
+    image_path: str | None,
+) -> str | None:
+    """
+    Use VEED Fabric 1.0 Fast via fal to generate a simple explainer MP4.
+    Requires:
+      - audio_path: local MP3 from TTS
+      - image_path: local PNG/JPG to animate
+    Returns local path to the MP4 or None.
+    """
+    if not FAL_KEY:
+        print("WARNING: FAL_KEY not set, skipping VEED video generation.")
+        return None
+
+    if not audio_path:
+        print("No audio available for video.")
+        return None
+
+    if not image_path:
+        print("No image provided for Fabric 1.0 video.")
+        return None
+
+    # Upload audio and image to fal storage
+    audio_url = upload_file_to_fal(audio_path)
+    if not audio_url:
+        print("Could not upload audio to fal. No audio URL:", audio_url)
+        return None
+
+    image_url = upload_file_to_fal(image_path)
+    if not image_url:
+        print("Could not upload image to fal. No image URL:", image_url)
+        return None
+
+    os.makedirs("outputs", exist_ok=True)
+    out_path = os.path.join("outputs", f"video_{uuid.uuid4().hex[:8]}.mp4")
+
+    try:
+        # Fabric 1.0 Fast endpoint
+        result = fal_client.subscribe(
+            "veed/fabric-1.0",
+            arguments={
+                "image_url": image_url,
+                "audio_url": audio_url,
+                "resolution": "720p",
+            },
+            with_logs=False,
+        )
+
+        # Expected: { "video": { "content_type": "video/mp4", "url": "https://..." } }
+        video_info = None
+        if isinstance(result, dict):
+            video_info = result.get("video") or result.get("output") or result
+
+        if not video_info or "url" not in video_info:
+            print("Could not find video URL in fal response:", result)
+            return None
+
+        video_url = video_info["url"]
+
+        resp = requests.get(video_url, stream=True)
+        resp.raise_for_status()
+
+        with open(out_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+        return out_path
+
+    except Exception as e:
+        print("Error generating VEED Fabric video via fal:", repr(e))
+        return None
+
+
+def clamp_script_length(text: str, max_words: int = 150) -> str:
+    """
+    Ensure the script is no longer than `max_words` words.
+    We keep whole words and just truncate, which is fine for narration.
+    """
+    if not text:
+        return text
+
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+
+    # Cut to max_words and make sure it ends with a period.
+    trimmed = " ".join(words[:max_words])
+    trimmed = trimmed.rstrip()
+
+    if not trimmed.endswith((".", "!", "?")):
+        trimmed += "."
+
+    return trimmed
+
+
 if __name__ == "__main__":
-    audio_path, script, vid = generate_video_story(
+    audio_path, script, video_path = generate_video_story(
         "Citizen", "Education Access 2023", language="en"
     )
-    print("Audio path:", audio_path)
-    print("Video path (placeholder):", vid)
-    print("\n=== Generated Script ===\n")
+    print("Audio:", audio_path)
+    print("Video:", video_path)
+    print("\n=== Script ===\n")
     print(script)
