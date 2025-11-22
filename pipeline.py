@@ -4,6 +4,10 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from elevenlabs.client import ElevenLabs
 import uuid
+import requests
+
+import fal_client
+
 
 load_dotenv()
 
@@ -14,6 +18,8 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 el_client = ElevenLabs(api_key=ELEVENLABS_API_KEY) if ELEVENLABS_API_KEY else None
+
+FAL_KEY = os.getenv("FAL_KEY")
 
 
 def load_education_data() -> pd.DataFrame:
@@ -176,37 +182,76 @@ def generate_video_story(
     return audio_path, script, video_path
 
 
-def text_to_speech_file(
-    text: str, voice_id: str = "pNInz6obpgDQGcFmaJgB"
-) -> str | None:
+def text_to_speech_file(text: str, voice: str = "Rachel") -> str | None:
     """
-    Convert narration text to an MP3 file using ElevenLabs.
-    Returns the path to the saved file, or None on failure.
+    Generate MP3 narration using ElevenLabs Turbo v2.5 via fal.
+    Returns local file path to the MP3, or None on failure.
     """
-    if el_client is None:
-        print("WARNING: ELEVENLABS_API_KEY not set, skipping audio generation.")
+    if not FAL_KEY:
+        print("WARNING: FAL_KEY not set, skipping audio generation.")
         return None
 
     os.makedirs("outputs", exist_ok=True)
-    filename = os.path.join("outputs", f"education_story_{uuid.uuid4().hex[:8]}.mp3")
+    out_path = os.path.join("outputs", f"tts_{uuid.uuid4().hex[:8]}.mp3")
 
     try:
-        # Standard TTS-to-file pattern from ElevenLabs docs
-        # This returns an iterator of bytes chunks that we write to disk.
-        response = el_client.text_to_speech.convert(
-            voice_id=voice_id,  # pre-made voice (Adam)
-            output_format="mp3_22050_32",  # small but clear
-            text=text,
-            model_id="eleven_turbo_v2_5",
+        result = fal_client.subscribe(
+            "fal-ai/elevenlabs/tts/turbo-v2.5",
+            arguments={
+                "text": text,
+                # Optional tunables – safe defaults:
+                "voice": voice,  # defaults to "Rachel" if omitted
+                "stability": 0.5,
+                "similarity_boost": 0.75,
+                "speed": 1.0,
+            },
+            with_logs=False,
         )
 
-        with open(filename, "wb") as f:
-            for chunk in response:
-                f.write(chunk)
+        # According to docs: { "audio": { "url": "https://..." } }
+        audio = result.get("audio")
+        if not audio or "url" not in audio:
+            print("fal TTS result missing audio.url:", result)
+            return None
 
-        return filename
+        audio_url = audio["url"]
+
+        resp = requests.get(audio_url, stream=True)
+        resp.raise_for_status()
+
+        with open(out_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+        return out_path
+
     except Exception as e:
-        print("ElevenLabs error, could not generate audio:", repr(e))
+        print("Error generating audio via fal ElevenLabs:", repr(e))
+        return None
+
+
+def upload_audio_to_fal(audio_path: str) -> str | None:
+    """
+    Upload local audio file to fal storage and return a URL fal/VEED can see.
+    """
+    if fal_client is None:
+        print("WARNING: FAL_KEY not set, skipping video generation.")
+        return None
+
+    if not os.path.exists(audio_path):
+        print(f"Audio file not found, cannot upload: {audio_path}")
+        return None
+
+    try:
+        with open(audio_path, "rb") as f:
+            uploaded = fal_client.storage.upload_file(
+                f, filename=os.path.basename(audio_path)
+            )
+        # uploaded.url should be an HTTPS URL accessible to VEED within fal
+        return uploaded.url
+    except Exception as e:
+        print("Error uploading audio to fal:", repr(e))
         return None
 
 
