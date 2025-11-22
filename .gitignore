@@ -8,7 +8,7 @@ node_modules/
 *.csv
 *.mp4
 *.json
-*.txt
+# *.txt
 *.pdf
 *.zip
 *.rar
