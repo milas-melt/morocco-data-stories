@@ -2,6 +2,8 @@ import os
 import pandas as pd
 from dotenv import load_dotenv
 from openai import OpenAI
+from elevenlabs.client import ElevenLabs
+import uuid
 
 load_dotenv()
 
@@ -9,6 +11,9 @@ DATA_PATH = "data/education_access_2023.csv"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+el_client = ElevenLabs(api_key=ELEVENLABS_API_KEY) if ELEVENLABS_API_KEY else None
 
 
 def load_education_data() -> pd.DataFrame:
@@ -157,19 +162,59 @@ def generate_video_story(
     Orchestration function.
 
     For now:
-    - Returns (video_path=None, script=text)
+    - Generate narration script with OpenAI
+    - Generate MP3 narration with ElevenLabs
+    - Return (audio_path, script, video_path=None)
     """
     df = load_education_data()
     summary = summarise_for_llm(df)
     script = generate_script_llm(persona=persona, summary=summary, language=language)
-    video_path = None  # placeholder for later
-    return video_path, script
+
+    audio_path = text_to_speech_file(script)
+    video_path = None  # placeholder for VEED / fal integration later
+
+    return audio_path, script, video_path
+
+
+def text_to_speech_file(
+    text: str, voice_id: str = "pNInz6obpgDQGcFmaJgB"
+) -> str | None:
+    """
+    Convert narration text to an MP3 file using ElevenLabs.
+    Returns the path to the saved file, or None on failure.
+    """
+    if el_client is None:
+        print("WARNING: ELEVENLABS_API_KEY not set, skipping audio generation.")
+        return None
+
+    os.makedirs("outputs", exist_ok=True)
+    filename = os.path.join("outputs", f"education_story_{uuid.uuid4().hex[:8]}.mp3")
+
+    try:
+        # Standard TTS-to-file pattern from ElevenLabs docs
+        # This returns an iterator of bytes chunks that we write to disk.
+        response = el_client.text_to_speech.convert(
+            voice_id=voice_id,  # pre-made voice (Adam)
+            output_format="mp3_22050_32",  # small but clear
+            text=text,
+            model_id="eleven_turbo_v2_5",
+        )
+
+        with open(filename, "wb") as f:
+            for chunk in response:
+                f.write(chunk)
+
+        return filename
+    except Exception as e:
+        print("ElevenLabs error, could not generate audio:", repr(e))
+        return None
 
 
 if __name__ == "__main__":
-    vid, script = generate_video_story(
+    audio_path, script, vid = generate_video_story(
         "Citizen", "Education Access 2023", language="en"
     )
+    print("Audio path:", audio_path)
     print("Video path (placeholder):", vid)
     print("\n=== Generated Script ===\n")
     print(script)
