@@ -1,7 +1,14 @@
 import os
 import pandas as pd
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
 
 DATA_PATH = "data/education_access_2023.csv"
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
 def load_education_data() -> pd.DataFrame:
@@ -9,7 +16,6 @@ def load_education_data() -> pd.DataFrame:
     if not os.path.exists(DATA_PATH):
         raise FileNotFoundError(f"Expected aggregated data at {DATA_PATH}")
     df = pd.read_csv(DATA_PATH)
-    # Basic sanity checks
     expected_cols = {
         "region",
         "year",
@@ -24,10 +30,7 @@ def load_education_data() -> pd.DataFrame:
 
 
 def summarise_for_llm(df: pd.DataFrame) -> str:
-    """
-    Build a compact textual summary of the dataset
-    that we'll later feed to the LLM (for now we just print it).
-    """
+    """Build a compact textual summary of the dataset for the LLM."""
     year = int(df["year"].iloc[0]) if "year" in df.columns else 2023
 
     total_schools = int(df["total_schools"].sum())
@@ -36,7 +39,6 @@ def summarise_for_llm(df: pd.DataFrame) -> str:
 
     n_regions = df["region"].nunique()
 
-    # Top / bottom regions by total schools
     df_sorted = df.sort_values("total_schools", ascending=False)
     top_regions = df_sorted.head(3)[["region", "total_schools"]].values.tolist()
     bottom_regions = df_sorted.tail(3)[["region", "total_schools"]].values.tolist()
@@ -63,14 +65,8 @@ def summarise_for_llm(df: pd.DataFrame) -> str:
     return " ".join(lines)
 
 
-def generate_script_stub(persona: str = "Citizen") -> str:
-    """
-    For now, generate a simple narration script WITHOUT calling OpenAI.
-    We'll plug OpenAI in later using this as a fallback / template.
-    """
-    df = load_education_data()
-    summary = summarise_for_llm(df)
-
+def generate_script_stub(persona: str, summary: str) -> str:
+    """Simple fallback script if OpenAI is not available."""
     if persona.lower() == "investor":
         persona_intro = "This story is tailored for investors interested in regional opportunities in Morocco. "
     else:
@@ -86,29 +82,94 @@ def generate_script_stub(persona: str = "Citizen") -> str:
     return script
 
 
+def generate_script_llm(persona: str, summary: str, language: str = "en") -> str:
+    """
+    Use OpenAI Chat Completions to turn the summary into a narration script.
+    """
+    if client is None:
+        print("WARNING: OPENAI_API_KEY not set, using stub script.")
+        return generate_script_stub(persona, summary)
+
+    persona_desc = (
+        "a Moroccan citizen with limited technical background"
+        if persona.lower() == "citizen"
+        else "a foreign investor interested in regional opportunities in Morocco"
+    )
+
+    lang_desc = {
+        "en": "English",
+        "fr": "French",
+        "ar": "Arabic",
+    }.get(language, "English")
+
+    system_prompt = (
+        "You are an expert policy communicator. "
+        "You write short, clear narration scripts based on structured data summaries. "
+        "Avoid jargon, keep it accessible, and speak in a warm, natural tone. "
+        "The script will be voiced over in a short explainer video about Morocco."
+    )
+
+    user_prompt = f"""
+Write a narration script of about 160 to 220 words in {lang_desc}.
+
+Audience: {persona_desc}.
+
+Topic: Education access across Moroccan regions.
+
+Data summary (you must base your story on this, but you may reorder and rephrase):
+
+\"\"\"{summary}\"\"\".
+
+Requirements:
+- Start with 1–2 sentences setting the context (Morocco, education, regions).
+- Explain what the total number of schools and regions means in simple terms.
+- Highlight the regions with the most and fewest schools and what that implies.
+- For citizens: focus on fairness, access, and development.
+- For investors: also hint at where infrastructure or human capital may be under-served.
+- End with a forward-looking, hopeful sentence about using data to improve education.
+- No bullet points, just continuous spoken text.
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        text = response.choices[0].message.content.strip()
+        if not text:
+            print("Empty LLM response, using stub script.")
+            return generate_script_stub(persona, summary)
+        return text
+    except Exception as e:
+        print("OpenAI error, using stub script:", repr(e))
+        return generate_script_stub(persona, summary)
+
+
 def generate_video_story(
-    persona: str = "Citizen", topic: str = "Education Access 2023"
+    persona: str = "Citizen",
+    topic: str = "Education Access 2023",
+    language: str = "en",
 ):
     """
     Orchestration function.
 
     For now:
-    - Ignores topic (we only have one)
     - Returns (video_path=None, script=text)
-
-    Later:
-    - Will call OpenAI for a richer script
-    - Will call ElevenLabs for TTS
-    - Will build an MP4 with moviepy or VEED
     """
-    script = generate_script_stub(persona=persona)
+    df = load_education_data()
+    summary = summarise_for_llm(df)
+    script = generate_script_llm(persona=persona, summary=summary, language=language)
     video_path = None  # placeholder for later
     return video_path, script
 
 
 if __name__ == "__main__":
-    # Quick manual test
-    vid, script = generate_video_story("Citizen", "Education Access 2023")
+    vid, script = generate_video_story(
+        "Citizen", "Education Access 2023", language="en"
+    )
     print("Video path (placeholder):", vid)
     print("\n=== Generated Script ===\n")
     print(script)
